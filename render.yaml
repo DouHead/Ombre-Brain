@@ -28,4 +28,4 @@ services:
     disk:
       name: ombre-buckets
       mountPath: /opt/render/project/src/buckets
-      sizeGB: 5              # bge-m3 model ~2.2GB + buckets; free plan only has 1GB, upgrade needed
+      sizeGB: 2              # buckets are small markdown files; API embed backend means no local model on disk

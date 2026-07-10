@@ -1,11 +1,11 @@
 services:
   - type: web
     name: ombre-brain
-    env: python
+    runtime: python
     region: oregon
     plan: starter
     buildCommand: pip install -r requirements.txt
-    startCommand: python src/server.py
+    startCommand: OMBRE_PORT=$PORT python src/server.py
     envVars:
       - key: OMBRE_TRANSPORT
         value: streamable-http

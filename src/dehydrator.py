@@ -58,7 +58,8 @@ logger = logging.getLogger("ombre_brain.dehydrator")
 # --- 脱水缓存版本号 ---
 # 改任何会影响脱水/合并输出的 prompt 时 +1，使存量缓存自然失效（见 _content_key）。
 # v2：DEHYDRATE/MERGE 加入「视角铁律」，强制保留第一人称（我 / 人名）。
-_PROMPT_VERSION = 2
+# v3：MERGE 加入「原话逐字保留」（2026-08-08）；120% 长度上限对原话让位。
+_PROMPT_VERSION = 3
 
 # --- LLM 默认参数 ---
 _DEFAULT_MODEL = "gemini-2.0-flash"
@@ -200,15 +201,23 @@ arousal: 0~1（0=平静, 0.5=普通, 1=激动）"""
 
 # --- Merge prompt: instruct LLM to blend old and new memories ---
 # --- 合并提示词：指导 LLM 揉合新旧记忆 ---
+#
+# Rule 4 (verbatim quotes) added 2026-08-08. Before it this prompt asked for the
+# facts and never once mentioned the wording, so any quoted sentence in a bucket
+# could be silently paraphrased the next time a similar memory arrived. `pinned`
+# was the only thing that blocked a merge, and there are 20 pinned slots. Quotes
+# are evidence, not raw material: the 120% ceiling now yields to them instead of
+# squeezing them out.
 MERGE_PROMPT = """你是一个信息合并专家。请将旧记忆与新内容合并为一份统一的简洁记录。
 
 合并规则：
 1. 新内容与旧记忆冲突时，以新内容为准
 2. 去除重复信息
 3. 保留所有重要事实
-4. 总长度尽量不超过旧记忆的 120%
-5. 对出现的人名、地名、专有名词用 [[双链]] 标记（如 [[人名]]、[[专有名词]]），普通词汇不要加
-6. 严格保留第一人称视角（见下方视角铁律）
+4. 逐字保留引号内的原话（“…”、"…"、'…'、「…」）：不得改写、缩短、转述、润色或翻译。原话是证据，不是素材。任何标记为「原话」或「verbatim」的小节，整节逐字保留
+5. 总长度尽量不超过旧记忆的 120%；若为逐字保留原话而超出，以保留原话为准
+6. 对出现的人名、地名、专有名词用 [[双链]] 标记（如 [[人名]]、[[专有名词]]），普通词汇不要加
+7. 严格保留第一人称视角（见下方视角铁律）
 
 直接输出合并后的文本，不要加额外说明。"""
 

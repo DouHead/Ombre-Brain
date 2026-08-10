@@ -29,6 +29,7 @@ from datetime import datetime, timezone, timedelta
 
 from .. import _runtime as rt
 from utils import strip_wikilinks, count_tokens_approx
+from ._concurrent import dehydrate_many
 
 # U-07 fix: throttle the sampling-fallback INFO log to once per 5 minutes.
 # 库小且 sampling=ON 时此分支每次 breath 都触发，原本会刷屏；改为 ≥300s
@@ -72,18 +73,14 @@ async def surface_default(max_results: int, max_tokens: int, tag_filter: list) -
     ]
     pinned_ids = {b["id"] for b in pinned_buckets}
     pinned_results = []
-    for b in pinned_buckets:
-        try:
-            clean_meta = {k: v for k, v in b["metadata"].items() if k != "tags"}
-            summary = await rt.dehydrator.dehydrate(strip_wikilinks(b["content"]), clean_meta)
-            if not str(summary or "").strip():
-                summary = _raw_core_fallback(b["content"])
-            pinned_results.append(f"📌 [核心准则] [bucket_id:{b['id']}] {summary}")
-        except Exception as e:
-            rt.logger.warning(f"Failed to dehydrate pinned bucket / 钉选桶脱水失败: {e}")
-            # 降级：直接展示原文片段，确保核心准则永远可见
-            fallback = _raw_core_fallback(b["content"])
-            pinned_results.append(f"📌 [核心准则] [bucket_id:{b['id']}] {fallback}")
+    # 并发脱水：钉选桶全部都要展示。冷缓存下串行 20 条就能吃掉整个 60s 超时窗口，
+    # 而超时又让缓存写不回去，于是永远冷着——并发是让它有机会写满缓存的唯一办法。
+    pinned_summaries = await dehydrate_many(pinned_buckets)
+    for b, summary in zip(pinned_buckets, pinned_summaries):
+        # 降级：直接展示原文片段，确保核心准则永远可见
+        if not str(summary or "").strip():
+            summary = _raw_core_fallback(b["content"])
+        pinned_results.append(f"📌 [核心准则] [bucket_id:{b['id']}] {summary}")
 
     # --- iter 2.0: anchor 桶在默认浮现模式的 *未解决池* 不出现（anchor 是坐标系不是浮现对象）---
     # anchor 过滤仅作用于 unresolved 候选，不影响 pinned 提取（上方已完成）。
@@ -198,21 +195,20 @@ async def surface_default(max_results: int, max_tokens: int, tag_filter: list) -
     candidates = candidates[:max_results]
 
     dynamic_results = []
-    for b in candidates:
+    # candidates 已按 max_results 截断，先并发脱水再按预算裁剪。
+    # 预算外的那几条也顺手写进了缓存，下一次 breath 直接命中。
+    candidate_summaries = await dehydrate_many(candidates)
+    for b, summary in zip(candidates, candidate_summaries):
         if token_budget <= 0:
             break
-        try:
-            clean_meta = {k: v for k, v in b["metadata"].items() if k != "tags"}
-            summary = await rt.dehydrator.dehydrate(strip_wikilinks(b["content"]), clean_meta)
-            summary_tokens = count_tokens_approx(summary)
-            if summary_tokens > token_budget:
-                break
-            score = rt.decay_engine.calculate_score(b["metadata"])
-            dynamic_results.append(f"[权重:{score:.2f}] [bucket_id:{b['id']}] {summary}")
-            token_budget -= summary_tokens
-        except Exception as e:
-            rt.logger.warning(f"Failed to dehydrate surfaced bucket / 浮现脱水失败: {e}")
+        if not str(summary or "").strip():
             continue
+        summary_tokens = count_tokens_approx(summary)
+        if summary_tokens > token_budget:
+            break
+        score = rt.decay_engine.calculate_score(b["metadata"])
+        dynamic_results.append(f"[权重:{score:.2f}] [bucket_id:{b['id']}] {summary}")
+        token_budget -= summary_tokens
 
     if not pinned_results and not dynamic_results:
         if rt.mark_op:
@@ -258,13 +254,11 @@ async def surface_default(max_results: int, max_tokens: int, tag_filter: list) -
                 passive_pool.append(b)
         if passive_pool:
             random.shuffle(passive_pool)
-            for b in passive_pool[:2]:
-                try:
-                    clean_meta = {k: v for k, v in b["metadata"].items() if k != "tags"}
-                    summary = await rt.dehydrator.dehydrate(strip_wikilinks(b["content"]), clean_meta)
-                    passive_results.append(f"💤 [久未浮现] [bucket_id:{b['id']}] {summary}")
-                except Exception as e:
-                    rt.logger.warning(f"passive association dehydrate failed: {e}")
+            passive_picks = passive_pool[:2]
+            for b, summary in zip(passive_picks, await dehydrate_many(passive_picks)):
+                if not str(summary or "").strip():
+                    continue
+                passive_results.append(f"💤 [久未浮现] [bucket_id:{b['id']}] {summary}")
     except Exception as e:
         rt.logger.warning(f"passive association block failed: {e}")
 
@@ -284,14 +278,12 @@ async def surface_default(max_results: int, max_tokens: int, tag_filter: list) -
             ]
             if resolved_pool:
                 random.shuffle(resolved_pool)
-                for b in resolved_pool[:3]:
-                    try:
-                        clean_meta = {k: v for k, v in b["metadata"].items() if k != "tags"}
-                        summary = await rt.dehydrator.dehydrate(strip_wikilinks(b["content"]), clean_meta)
-                        dream_results.append(f"✨ [偶遇] [bucket_id:{b['id']}] {summary}")
-                        rt.logger.info(f"Dream surface triggered / 偶遇机制触发: {b['id']}")
-                    except Exception as e:
-                        rt.logger.warning(f"Dream surface dehydrate failed / 偶遇脱水失败: {e}")
+                dream_picks = resolved_pool[:3]
+                for b, summary in zip(dream_picks, await dehydrate_many(dream_picks)):
+                    if not str(summary or "").strip():
+                        continue
+                    dream_results.append(f"✨ [偶遇] [bucket_id:{b['id']}] {summary}")
+                    rt.logger.info(f"Dream surface triggered / 偶遇机制触发: {b['id']}")
         except Exception as e:
             rt.logger.warning(f"Dream surface block failed / 偶遇模块异常: {e}")
 

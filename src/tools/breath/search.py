@@ -29,6 +29,7 @@ import random
 
 from .. import _runtime as rt
 from utils import strip_wikilinks, count_tokens_approx
+from ._concurrent import dehydrate_many
 
 
 def _bucket_has_tags(meta: dict, tag_filter: list) -> bool:
@@ -94,24 +95,28 @@ async def surface_search(
 
     results = []
     token_used = 0
-    for bucket in matches:
+
+    # --- 记忆重构：根据当前情绪微调展示层 valence（±0.1）---
+    def _shift_valence(clean_meta: dict) -> dict:
+        if q_valence is not None and "valence" in clean_meta:
+            original_v = float(clean_meta.get("valence") or 0.5)
+            shift = (q_valence - 0.5) * 0.2
+            clean_meta["valence"] = max(0.0, min(1.0, original_v + shift))
+        return clean_meta
+
+    # 并发脱水：冷缓存下逐条 await 会吃掉整个超时窗口（见 _concurrent.py）
+    match_summaries = await dehydrate_many(matches, meta_transform=_shift_valence)
+
+    for idx, bucket in enumerate(matches):
         if token_used >= max_tokens:
             break
         try:
-            clean_meta = {k: v for k, v in bucket["metadata"].items() if k != "tags"}
             meta_b = bucket["metadata"]
             is_core = meta_b.get("pinned") or meta_b.get("protected") or meta_b.get("type") == "permanent"
-            # --- 记忆重构：根据当前情绪微调展示层 valence（±0.1）---
-            if q_valence is not None and "valence" in clean_meta:
-                original_v = float(clean_meta.get("valence") or 0.5)
-                shift = (q_valence - 0.5) * 0.2
-                clean_meta["valence"] = max(0.0, min(1.0, original_v + shift))
-            try:
-                summary = await rt.dehydrator.dehydrate(strip_wikilinks(bucket["content"]), clean_meta)
-            except Exception as dehy_err:
+            summary = match_summaries[idx]
+            if not str(summary or "").strip():
                 if not is_core:
-                    raise
-                rt.logger.warning(f"core search result dehydrate failed, using raw fallback: {dehy_err}")
+                    continue
                 summary = _raw_core_fallback(bucket["content"])
             if is_core and not str(summary or "").strip():
                 summary = _raw_core_fallback(bucket["content"])
@@ -148,9 +153,9 @@ async def surface_search(
             if low_weight:
                 drifted = random.sample(low_weight, min(random.randint(1, 3), len(low_weight)))
                 drift_results = []
-                for b in drifted:
-                    clean_meta = {k: v for k, v in b["metadata"].items() if k != "tags"}
-                    summary = await rt.dehydrator.dehydrate(strip_wikilinks(b["content"]), clean_meta)
+                for summary in await dehydrate_many(drifted):
+                    if not str(summary or "").strip():
+                        continue
                     drift_results.append(f"[surface_type: random]\n{summary}")
                 results.append("--- 忽然想起来 ---\n" + "\n---\n".join(drift_results))
         except Exception as e:

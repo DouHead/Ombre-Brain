@@ -94,6 +94,7 @@ async def dispatch(
             importance_min=importance_min,
             max_tokens=max_tokens,
             tag_filter=tag_filter,
+            max_results=max_results,
         )
 
     # --- 无 query：浮现模式 ---
